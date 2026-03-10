@@ -24,7 +24,7 @@ from typing import Dict, Any, List, Optional
 
 DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     input_tokens INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
     title TEXT,
+    working_dir TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -151,6 +152,13 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass  # Index already exists
                 cursor.execute("UPDATE schema_version SET version = 4")
+            if current_version < 5:
+                # v5: add working_dir column for directory-based session filtering
+                try:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN working_dir TEXT")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 5")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -189,12 +197,13 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        working_dir: str = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
         self._conn.execute(
             """INSERT INTO sessions (id, source, user_id, model, model_config,
-               system_prompt, parent_session_id, started_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               system_prompt, parent_session_id, started_at, working_dir)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 source,
@@ -204,6 +213,7 @@ class SessionDB:
                 system_prompt,
                 parent_session_id,
                 time.time(),
+                working_dir,
             ),
         )
         self._conn.commit()
@@ -406,6 +416,7 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        working_dir: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -415,7 +426,17 @@ class SessionDB:
 
         Uses a single query with correlated subqueries instead of N+2 queries.
         """
-        source_clause = "WHERE s.source = ?" if source else ""
+        conditions = []
+        params = []
+
+        if source:
+            conditions.append("s.source = ?")
+            params.append(source)
+        if working_dir:
+            conditions.append("s.working_dir = ?")
+            params.append(working_dir)
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"""
             SELECT s.*,
                 COALESCE(
@@ -430,11 +451,11 @@ class SessionDB:
                     s.started_at
                 ) AS last_active
             FROM sessions s
-            {source_clause}
+            {where_clause}
             ORDER BY s.started_at DESC
             LIMIT ? OFFSET ?
         """
-        params = (source, limit, offset) if source else (limit, offset)
+        params.extend([limit, offset])
         cursor = self._conn.execute(query, params)
         sessions = []
         for row in cursor.fetchall():
@@ -645,18 +666,26 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        working_dir: str = None,
     ) -> List[Dict[str, Any]]:
-        """List sessions, optionally filtered by source."""
+        """List sessions, optionally filtered by source and/or working_dir."""
+        conditions = []
+        params = []
+
         if source:
-            cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE source = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                (source, limit, offset),
-            )
-        else:
-            cursor = self._conn.execute(
-                "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            )
+            conditions.append("source = ?")
+            params.append(source)
+        if working_dir:
+            conditions.append("working_dir = ?")
+            params.append(working_dir)
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.extend([limit, offset])
+
+        cursor = self._conn.execute(
+            f"SELECT * FROM sessions {where_clause} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            params,
+        )
         return [dict(row) for row in cursor.fetchall()]
 
     # =========================================================================

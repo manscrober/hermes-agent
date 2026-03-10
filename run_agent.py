@@ -488,6 +488,8 @@ class AIAgent:
         self._session_db = session_db
         if self._session_db:
             try:
+                # For CLI sessions, store the current working directory
+                working_dir = os.getcwd() if self.platform in ("cli", None) else None
                 self._session_db.create_session(
                     session_id=self.session_id,
                     source=self.platform or "cli",
@@ -498,6 +500,7 @@ class AIAgent:
                         "max_tokens": max_tokens,
                     },
                     user_id=None,
+                    working_dir=working_dir,
                 )
             except Exception as e:
                 logger.debug("Session DB create_session failed: %s", e)
@@ -2633,6 +2636,8 @@ class AIAgent:
             try:
                 # Propagate title to the new session with auto-numbering
                 old_title = self._session_db.get_session_title(self.session_id)
+                old_session = self._session_db.get_session(self.session_id)
+                old_working_dir = old_session.get("working_dir") if old_session else None
                 self._session_db.end_session(self.session_id, "compression")
                 old_session_id = self.session_id
                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -2641,6 +2646,7 @@ class AIAgent:
                     source=self.platform or "cli",
                     model=self.model,
                     parent_session_id=old_session_id,
+                    working_dir=old_working_dir,
                 )
                 # Auto-number the title for the continuation session
                 if old_title:

@@ -381,11 +381,14 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
 
 
 def _resolve_last_cli_session() -> Optional[str]:
-    """Look up the most recent CLI session ID from SQLite. Returns None if unavailable."""
+    """Look up the most recent CLI session ID from SQLite, filtered by current working directory.
+    
+    Returns None if unavailable.
+    """
     try:
         from hermes_state import SessionDB
         db = SessionDB()
-        sessions = db.search_sessions(source="cli", limit=1)
+        sessions = db.search_sessions(source="cli", working_dir=os.getcwd(), limit=1)
         db.close()
         if sessions:
             return sessions[0]["id"]
@@ -435,13 +438,25 @@ def cmd_chat(args):
                 print("Use 'hermes sessions list' to see available sessions.")
                 sys.exit(1)
         else:
-            # -c with no argument — continue the most recent session
-            last_id = _resolve_last_cli_session()
-            if last_id:
-                args.resume = last_id
-            else:
-                print("No previous CLI session found to continue.")
+            # -c with no argument — show interactive session picker
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                sessions = db.list_sessions_rich(source="cli", working_dir=os.getcwd(), limit=50)
+                db.close()
+            except Exception:
+                sessions = []
+
+            if not sessions:
+                print("No previous CLI sessions found in this directory.")
                 sys.exit(1)
+
+            selected_id = _session_browse_picker(sessions)
+            if selected_id:
+                args.resume = selected_id
+            else:
+                # User cancelled picker
+                sys.exit(0)
 
     # Resolve --resume by title if it's not a direct session ID
     resume_val = getattr(args, "resume", None)
@@ -2264,6 +2279,8 @@ For more help on a command:
     sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions")
     sessions_list.add_argument("--source", help="Filter by source (cli, telegram, discord, etc.)")
     sessions_list.add_argument("--limit", type=int, default=20, help="Max sessions to show")
+    sessions_list.add_argument("--cwd", action="store_true", help="Filter to sessions from current directory (default for cli source)")
+    sessions_list.add_argument("--all-dirs", action="store_true", help="Show sessions from all directories (override default cwd filter)")
 
     sessions_export = sessions_subparsers.add_parser("export", help="Export sessions to a JSONL file")
     sessions_export.add_argument("output", help="Output JSONL file path")
@@ -2304,9 +2321,21 @@ For more help on a command:
         action = args.sessions_action
 
         if action == "list":
-            sessions = db.list_sessions_rich(source=args.source, limit=args.limit)
+            # Determine working directory filter
+            # By default, filter to current directory for CLI source
+            working_dir = None
+            source_filter = args.source
+            if not args.all_dirs:
+                if args.cwd or (source_filter == "cli" or source_filter is None):
+                    working_dir = os.getcwd()
+            
+            sessions = db.list_sessions_rich(source=source_filter, limit=args.limit, working_dir=working_dir)
             if not sessions:
-                print("No sessions found.")
+                if working_dir:
+                    print(f"No sessions found in current directory: {working_dir}")
+                    print("Use --all-dirs to see sessions from all directories.")
+                else:
+                    print("No sessions found.")
                 return
             from datetime import datetime
             import time as _time
@@ -2333,22 +2362,23 @@ For more help on a command:
                     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
             has_titles = any(s.get("title") for s in sessions)
+            # Show full session IDs (not truncated)
             if has_titles:
-                print(f"{'Title':<22} {'Preview':<40} {'Last Active':<13} {'ID'}")
-                print("─" * 100)
+                print(f"{'Title':<24} {'Preview':<40} {'Last Active':<12} {'Session ID'}")
+                print("─" * 120)
             else:
-                print(f"{'Preview':<50} {'Last Active':<13} {'Src':<6} {'ID'}")
-                print("─" * 90)
+                print(f"{'Preview':<50} {'Last Active':<12} {'Src':<6} {'Session ID'}")
+                print("─" * 120)
             for s in sessions:
                 last_active = _relative_time(s.get("last_active"))
                 preview = s.get("preview", "")[:38] if has_titles else s.get("preview", "")[:48]
+                # Full session ID (not truncated)
+                sid = s["id"]
                 if has_titles:
-                    title = (s.get("title") or "—")[:20]
-                    sid = s["id"][:20]
-                    print(f"{title:<22} {preview:<40} {last_active:<13} {sid}")
+                    title = (s.get("title") or "—")[:22]
+                    print(f"{title:<24} {preview:<40} {last_active:<12} {sid}")
                 else:
-                    sid = s["id"][:20]
-                    print(f"{preview:<50} {last_active:<13} {s['source']:<6} {sid}")
+                    print(f"{preview:<50} {last_active:<12} {s['source']:<6} {sid}")
 
         elif action == "export":
             if args.session_id:

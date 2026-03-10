@@ -2267,7 +2267,8 @@ class GatewayRunner:
                     transcript = result["transcript"]
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
-                        f'Here\'s what they said: "{transcript}"]'
+                        f'Here\'s what they said: "{transcript}"]\n\n'
+                        f'(Include this transcription at the start of your reply)'
                     )
                 else:
                     error = result.get("error", "unknown error")

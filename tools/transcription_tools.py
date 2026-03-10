@@ -2,12 +2,20 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription using OpenAI's Whisper API.
+Provides speech-to-text transcription using faster-whisper (local) 
+with optional fallback to OpenAI's Whisper API.
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, and Slack.
 
-Supported models:
-  - whisper-1        (cheapest, good quality)
+Local models (faster-whisper):
+  - tiny, tiny.en      (fastest, lowest quality)
+  - base, base.en
+  - small, small.en
+  - medium, medium.en
+  - large-v3           (best quality, slower)
+
+OpenAI fallback models:
+  - whisper-1          (cheapest, good quality)
   - gpt-4o-mini-transcribe  (better quality, higher cost)
   - gpt-4o-transcribe       (best quality, highest cost)
 
@@ -28,34 +36,84 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# Default local model (good balance of speed/quality)
+DEFAULT_LOCAL_MODEL = os.getenv("WHISPER_LOCAL_MODEL", "base")
 
-# Default STT model -- cheapest and widely available
-DEFAULT_STT_MODEL = "whisper-1"
+# Default OpenAI model for fallback
+DEFAULT_OPENAI_MODEL = "whisper-1"
 
 # Supported audio formats
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg"}
 
-# Maximum file size (25MB - OpenAI limit)
+# Maximum file size (25MB - OpenAI limit, but also reasonable for local)
 MAX_FILE_SIZE = 25 * 1024 * 1024
 
+# Cache for loaded whisper model
+_whisper_model = None
 
-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Transcribe an audio file using OpenAI's Whisper API.
 
-    This function calls the OpenAI Audio Transcriptions endpoint directly
-    (not via OpenRouter, since Whisper isn't available there).
+def _get_local_model(model_size: str = None):
+    """Load or return cached faster-whisper model."""
+    global _whisper_model
+    
+    if _whisper_model is None:
+        try:
+            from faster_whisper import WhisperModel
+            model_name = model_size or DEFAULT_LOCAL_MODEL
+            logger.info("Loading faster-whisper model: %s", model_name)
+            # Use CPU for broader compatibility, can be configured via env var
+            device = os.getenv("WHISPER_DEVICE", "cpu")
+            compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+            _whisper_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+            logger.info("faster-whisper model loaded successfully")
+        except ImportError as e:
+            logger.warning("faster-whisper not available: %s", e)
+            return None
+        except Exception as e:
+            logger.error("Failed to load faster-whisper model: %s", e, exc_info=True)
+            return None
+    
+    return _whisper_model
 
-    Args:
-        file_path: Absolute path to the audio file to transcribe.
-        model:     Whisper model to use. Defaults to config or "whisper-1".
 
-    Returns:
-        dict with keys:
-          - "success" (bool): Whether transcription succeeded
-          - "transcript" (str): The transcribed text (empty on failure)
-          - "error" (str, optional): Error message if success is False
-    """
+def _transcribe_local(file_path: str, model_size: str = None) -> Dict[str, Any]:
+    """Transcribe using local faster-whisper."""
+    model = _get_local_model(model_size)
+    if model is None:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "faster-whisper not available",
+        }
+    
+    try:
+        segments, info = model.transcribe(file_path, beam_size=5)
+        transcript_text = "".join(segment.text for segment in segments).strip()
+        
+        logger.info(
+            "Local transcription of %s: %d chars (%.2fs audio, %.2fs processing)",
+            Path(file_path).name,
+            len(transcript_text),
+            info.duration,
+            info.transcription_time if hasattr(info, 'transcription_time') else 0,
+        )
+        
+        return {
+            "success": True,
+            "transcript": transcript_text,
+            "method": "faster-whisper",
+        }
+    except Exception as e:
+        logger.error("Local transcription failed: %s", e, exc_info=True)
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"Local transcription failed: {e}",
+        }
+
+
+def _transcribe_openai(file_path: str, model: str = None) -> Dict[str, Any]:
+    """Transcribe using OpenAI API (fallback)."""
     api_key = os.getenv("VOICE_TOOLS_OPENAI_KEY")
     if not api_key:
         return {
@@ -63,53 +121,10 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "transcript": "",
             "error": "VOICE_TOOLS_OPENAI_KEY not set",
         }
-
-    audio_path = Path(file_path)
     
-    # Validate file exists
-    if not audio_path.exists():
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Audio file not found: {file_path}",
-        }
-    
-    if not audio_path.is_file():
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Path is not a file: {file_path}",
-        }
-    
-    # Validate file extension
-    if audio_path.suffix.lower() not in SUPPORTED_FORMATS:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Unsupported file format: {audio_path.suffix}. Supported formats: {', '.join(sorted(SUPPORTED_FORMATS))}",
-        }
-    
-    # Validate file size
-    try:
-        file_size = audio_path.stat().st_size
-        if file_size > MAX_FILE_SIZE:
-            return {
-                "success": False,
-                "transcript": "",
-                "error": f"File too large: {file_size / (1024*1024):.1f}MB (max {MAX_FILE_SIZE / (1024*1024)}MB)",
-            }
-    except OSError as e:
-        logger.error("Failed to get file size for %s: %s", file_path, e, exc_info=True)
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Failed to access file: {e}",
-        }
-
-    # Use provided model, or fall back to default
     if model is None:
-        model = DEFAULT_STT_MODEL
-
+        model = DEFAULT_OPENAI_MODEL
+    
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
 
@@ -122,48 +137,75 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
                 response_format="text",
             )
 
-        # The response is a plain string when response_format="text"
         transcript_text = str(transcription).strip()
 
-        logger.info("Transcribed %s (%d chars)", audio_path.name, len(transcript_text))
+        logger.info("OpenAI transcription of %s: %d chars", Path(file_path).name, len(transcript_text))
 
         return {
             "success": True,
             "transcript": transcript_text,
+            "method": "openai",
         }
 
     except PermissionError:
-        logger.error("Permission denied accessing file: %s", file_path, exc_info=True)
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Permission denied: {file_path}",
-        }
-    except APIConnectionError as e:
-        logger.error("API connection error during transcription: %s", e, exc_info=True)
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Connection error: {e}",
-        }
-    except APITimeoutError as e:
-        logger.error("API timeout during transcription: %s", e, exc_info=True)
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Request timeout: {e}",
-        }
-    except APIError as e:
-        logger.error("OpenAI API error during transcription: %s", e, exc_info=True)
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"API error: {e}",
-        }
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
     except Exception as e:
-        logger.error("Unexpected error during transcription: %s", e, exc_info=True)
+        logger.error("OpenAI transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"OpenAI error: {e}"}
+
+
+def transcribe_audio(file_path: str, model: Optional[str] = None, prefer_local: bool = True) -> Dict[str, Any]:
+    """
+    Transcribe an audio file using faster-whisper (local) with OpenAI fallback.
+
+    Args:
+        file_path:   Absolute path to the audio file to transcribe.
+        model:       Model to use. For local: tiny/base/small/medium/large-v3.
+                     For OpenAI: whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe.
+        prefer_local: If True (default), try local transcription first.
+
+    Returns:
+        dict with keys:
+          - "success" (bool): Whether transcription succeeded
+          - "transcript" (str): The transcribed text (empty on failure)
+          - "error" (str, optional): Error message if success is False
+          - "method" (str, optional): "faster-whisper" or "openai"
+    """
+    audio_path = Path(file_path)
+    
+    # Validate file exists
+    if not audio_path.exists():
+        return {"success": False, "transcript": "", "error": f"Audio file not found: {file_path}"}
+    
+    if not audio_path.is_file():
+        return {"success": False, "transcript": "", "error": f"Path is not a file: {file_path}"}
+    
+    # Validate file extension
+    if audio_path.suffix.lower() not in SUPPORTED_FORMATS:
         return {
             "success": False,
             "transcript": "",
-            "error": f"Transcription failed: {e}",
+            "error": f"Unsupported format: {audio_path.suffix}. Supported: {', '.join(sorted(SUPPORTED_FORMATS))}",
         }
+    
+    # Validate file size
+    try:
+        file_size = audio_path.stat().st_size
+        if file_size > MAX_FILE_SIZE:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"File too large: {file_size / (1024*1024):.1f}MB (max {MAX_FILE_SIZE / (1024*1024)}MB)",
+            }
+    except OSError as e:
+        return {"success": False, "transcript": "", "error": f"Failed to access file: {e}"}
+
+    # Try local transcription first if preferred
+    if prefer_local:
+        result = _transcribe_local(file_path, model)
+        if result["success"]:
+            return result
+        logger.info("Local transcription failed, trying OpenAI fallback: %s", result.get("error"))
+    
+    # Fallback to OpenAI
+    return _transcribe_openai(file_path, model)

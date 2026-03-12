@@ -150,7 +150,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # Start polling in background
             await self._app.initialize()
             await self._app.start()
-            await self._app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            await self._app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+            )
             
             # Register bot commands so Telegram shows a hint menu when users type /
             try:

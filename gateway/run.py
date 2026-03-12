@@ -527,11 +527,13 @@ class GatewayRunner:
             logger.warning("Process checkpoint recovery: %s", e)
         
         connected_count = 0
+        enabled_platform_count = 0
         
         # Initialize and connect each configured platform
         for platform, platform_config in self.config.platforms.items():
             if not platform_config.enabled:
                 continue
+            enabled_platform_count += 1
             
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
@@ -555,6 +557,13 @@ class GatewayRunner:
                 logger.error("✗ %s error: %s", platform.value, e)
         
         if connected_count == 0:
+            if enabled_platform_count > 0:
+                logger.error(
+                    "No configured messaging platforms connected (%s enabled). "
+                    "Exiting so the service manager can retry on transient network failures.",
+                    enabled_platform_count,
+                )
+                return False
             logger.warning("No messaging platforms connected.")
             logger.info("Gateway will continue running for cron job execution.")
         

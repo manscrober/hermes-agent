@@ -309,10 +309,10 @@ def generate_launchd_plist() -> str:
     <true/>
     
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
     
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>

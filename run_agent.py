@@ -3968,7 +3968,17 @@ class AIAgent:
                     # Also catch local validation errors (ValueError, TypeError) — these
                     # are programming bugs, not transient failures.
                     is_local_validation_error = isinstance(api_error, (ValueError, TypeError))
-                    is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 413
+                    is_rate_limit_error = (
+                        status_code == 429
+                        or 'error code: 429' in error_msg
+                        or 'rate limit' in error_msg
+                        or 'too many requests' in error_msg
+                    )
+                    is_client_status_error = (
+                        isinstance(status_code, int)
+                        and 400 <= status_code < 500
+                        and status_code not in (413, 429)
+                    )
                     is_client_error = (is_local_validation_error or is_client_status_error or any(phrase in error_msg for phrase in [
                         'error code: 401', 'error code: 403',
                         'error code: 404', 'error code: 422',
@@ -3976,6 +3986,13 @@ class AIAgent:
                         'invalid api key', 'invalid_api_key', 'authentication',
                         'unauthorized', 'forbidden', 'not found',
                     ])) and not is_context_length_error
+
+                    if is_rate_limit_error and self.provider == 'openai-codex':
+                        print(f"{self.log_prefix}🚦 Codex rate limit detected — switching to fallback model immediately.")
+                        logging.warning(f"{self.log_prefix}Codex rate limit detected: {api_error}")
+                        if self._try_activate_fallback():
+                            retry_count = 0
+                            continue
 
                     if is_client_error:
                         # Try fallback before aborting — a different provider
